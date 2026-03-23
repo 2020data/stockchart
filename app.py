@@ -1,15 +1,9 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Mar 23 15:32:57 2026
-
-@author: e010
-"""
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-from pyecharts import options as opts
+import os
 from pyecharts.charts import Kline, Line, Grid
+from pyecharts import options as opts
 from streamlit_echarts import st_pyecharts
 
 # ==========================================
@@ -19,7 +13,7 @@ st.set_page_config(page_title="多週期彈性看盤系統", layout="wide")
 st.title("📊 專業多週期看板：台指期 (TX) vs 小那斯達克 (NQ)")
 
 # ==========================================
-# 定義時間週期與對應的安全抓取區間
+# 定義時間週期與對應的檔案命名區間
 # ==========================================
 INTERVAL_MAPPING = {
     "1 分鐘": "1m",
@@ -29,13 +23,18 @@ INTERVAL_MAPPING = {
     "1 天 (日K)": "1d"
 }
 
-# yfinance 限制：1m最多7天，5m/30m最多60天，60m最多730天
-PERIOD_MAPPING = {
-    "1m": "5d",     # 1分K 抓 5 天
-    "5m": "5d",     # 5分K 抓 5 天
-    "30m": "15d",   # 30分K 抓 15 天
-    "60m": "1mo",   # 60分K 抓 1 個月
-    "1d": "6mo"     # 日K 抓 半年
+# 為了對應上一個下載程式的檔名，我們建立轉換字典
+FILE_TICKER_MAP = {
+    "TX=F": "Taiwan_Index",
+    "NQ=F": "Micro_Nasdaq"
+}
+
+FILE_INTERVAL_MAP = {
+    "1m": "1min",
+    "5m": "5min",
+    "30m": "30min",
+    "60m": "60min",
+    "1d": "Daily"
 }
 
 # ==========================================
@@ -64,33 +63,39 @@ k_weight = st.sidebar.slider("K值 平滑權重", min_value=2, max_value=10, val
 d_weight = st.sidebar.slider("D值 平滑權重", min_value=2, max_value=10, value=3)
 
 # ==========================================
-# 3. 資料處理：第一步【只負責下載與整理格式】
+# 3. 資料處理：第一步【讀取本地 CSV 檔案】
 # ==========================================
 @st.cache_data(ttl=300)
-def fetch_raw_data(ticker, period="5d", interval="5m"):
-    df = yf.Ticker(ticker).history(period=period, interval=interval)
+def fetch_raw_data(ticker, interval="5m"):
+    # 將標的與週期轉換為對應的檔案名稱
+    file_ticker = FILE_TICKER_MAP.get(ticker, "Taiwan_Index")
+    file_interval = FILE_INTERVAL_MAP.get(interval, "5min")
     
-    # 自動備援機制
-    if df.empty and ticker == "TX=F":
-        df = yf.Ticker("^TWII").history(period=period, interval=interval)
+    # 組合檔案路徑
+    filepath = f"futures_historical_data/{file_ticker}_{file_interval}.csv"
+    
+    # 檢查檔案是否存在
+    if not os.path.exists(filepath):
+        st.error(f"找不到本地資料檔案：{filepath}")
+        return pd.DataFrame()
         
-    df = df.dropna()
+    # 讀取 CSV
+    df = pd.read_csv(filepath)
     if df.empty:
         return pd.DataFrame()
         
-    # 時區轉換為台北時間
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC').tz_convert('Asia/Taipei')
-    else:
-        df.index = df.index.tz_convert('Asia/Taipei')
-    
-    df = df.reset_index()
+    # 統整時間欄位名稱 (yfinance 下載下來可能是 Date 或 Datetime)
     if 'Datetime' in df.columns:
         df = df.rename(columns={'Datetime': 'time'})
     elif 'Date' in df.columns:
         df = df.rename(columns={'Date': 'time'})
         
+    # 統整價格欄位名稱為小寫，以符合後續邏輯
     df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'})
+    
+    # 將字串時間轉換為 datetime 物件，並處理時區
+    # 設定 utc=True 再轉換為台北時間，避免 yfinance 原始資料時區錯誤的問題
+    df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_convert('Asia/Taipei')
     
     # 根據週期智慧調整時間顯示格式 (日K只顯示日期，不顯示幾點幾分)
     if interval == '1d':
@@ -135,7 +140,7 @@ def apply_indicators(df, ma_list, n, k_w, d_w):
 # ==========================================
 def render_pyecharts(df, ma_list, chart_key):
     if df.empty:
-        st.warning("該週期無可用資料。")
+        st.warning("該週期無可用資料，請確認是否已下載 CSV 檔案。")
         return
 
     time_data = df['time'].tolist()
@@ -208,17 +213,16 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader(f"🇹🇼 台指期貨 (TX=F) - {row1_label}")
-    with st.spinner(f'讀取台指期 {row1_label} 資料...'):
-        raw_tw_row1 = fetch_raw_data("TX=F", period=PERIOD_MAPPING[row1_interval], interval=row1_interval)
-        final_tw_row1 = apply_indicators(raw_tw_row1, ma_params, kd_n, k_weight, d_weight)
-        render_pyecharts(final_tw_row1, ma_params, chart_key="tw_row1")
+    # 拿掉 period 參數，因為直接讀取整個 CSV 檔案
+    raw_tw_row1 = fetch_raw_data("TX=F", interval=row1_interval)
+    final_tw_row1 = apply_indicators(raw_tw_row1, ma_params, kd_n, k_weight, d_weight)
+    render_pyecharts(final_tw_row1, ma_params, chart_key="tw_row1")
 
 with col2:
     st.subheader(f"🇺🇸 小那斯達克 (NQ=F) - {row1_label}")
-    with st.spinner(f'讀取小那 {row1_label} 資料...'):
-        raw_nq_row1 = fetch_raw_data("NQ=F", period=PERIOD_MAPPING[row1_interval], interval=row1_interval)
-        final_nq_row1 = apply_indicators(raw_nq_row1, ma_params, kd_n, k_weight, d_weight)
-        render_pyecharts(final_nq_row1, ma_params, chart_key="nq_row1")
+    raw_nq_row1 = fetch_raw_data("NQ=F", interval=row1_interval)
+    final_nq_row1 = apply_indicators(raw_nq_row1, ma_params, kd_n, k_weight, d_weight)
+    render_pyecharts(final_nq_row1, ma_params, chart_key="nq_row1")
 
 st.divider()
 
@@ -228,14 +232,12 @@ col3, col4 = st.columns(2)
 
 with col3:
     st.subheader(f"🇹🇼 台指期貨 (TX=F) - {row2_label}")
-    with st.spinner(f'讀取台指期 {row2_label} 資料...'):
-        raw_tw_row2 = fetch_raw_data("TX=F", period=PERIOD_MAPPING[row2_interval], interval=row2_interval)
-        final_tw_row2 = apply_indicators(raw_tw_row2, ma_params, kd_n, k_weight, d_weight)
-        render_pyecharts(final_tw_row2, ma_params, chart_key="tw_row2")
+    raw_tw_row2 = fetch_raw_data("TX=F", interval=row2_interval)
+    final_tw_row2 = apply_indicators(raw_tw_row2, ma_params, kd_n, k_weight, d_weight)
+    render_pyecharts(final_tw_row2, ma_params, chart_key="tw_row2")
 
 with col4:
     st.subheader(f"🇺🇸 小那斯達克 (NQ=F) - {row2_label}")
-    with st.spinner(f'讀取小那 {row2_label} 資料...'):
-        raw_nq_row2 = fetch_raw_data("NQ=F", period=PERIOD_MAPPING[row2_interval], interval=row2_interval)
-        final_nq_row2 = apply_indicators(raw_nq_row2, ma_params, kd_n, k_weight, d_weight)
-        render_pyecharts(final_nq_row2, ma_params, chart_key="nq_row2")
+    raw_nq_row2 = fetch_raw_data("NQ=F", interval=row2_interval)
+    final_nq_row2 = apply_indicators(raw_nq_row2, ma_params, kd_n, k_weight, d_weight)
+    render_pyecharts(final_nq_row2, ma_params, chart_key="nq_row2")
